@@ -1,85 +1,76 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
-// ===== PIN DEFINITIONS (ESP32-S3) =====
+const char* ssid = "Orbit IoT";
+const char* password = "OrbitRyanRD";
+
+const String serverName = "https://73bj12ipia.execute-api.us-east-1.amazonaws.com/default/SmarParBackEnd";
+
 #define RS485_RX_PIN 18
 #define RS485_TX_PIN 17
-#define RS485_DE_PIN 4  // Direction Pin (Connect DE and RE here)
+#define RS485_DE_PIN 4 
 
-// ===== SETTINGS =====
 #define RS485_BAUD 9600
-#define POLL_TIMEOUT 200     // Wait 200ms for a reply before giving up
-#define POLL_INTERVAL 1000   // Poll every 1 second
+#define POLL_TIMEOUT 200     
+#define POLL_INTERVAL 1000   
 
-// List of Spots to Poll (You can add more here: "A10", "A11", "B01", etc.)
-String spotIDs[] = {"A10 "}; // Note: Space added to match the default formatting
+String spotIDs[] = {"A10 "}; 
 int spotCount = 1;
 
-// RS485 Control Logic
 #define RS485_TRANSMIT HIGH
 #define RS485_RECEIVE  LOW
 
 HardwareSerial RS485Serial(1);
 
-// Function Prototype
 void pollSensor(String id);
+void sendToAWS(String spotId, String status);
 
 void setup() {
-  // Debug Serial (USB)
   Serial.begin(115200);
   while (!Serial) delay(10); 
   
-  // RS485 Control Pin
-  pinMode(RS485_DE_PIN, OUTPUT);
-  digitalWrite(RS485_DE_PIN, RS485_RECEIVE); // Default to Listening
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi!");
 
-  // RS485 UART Initialization
-  // Pin 17/18 are standard UART1 for ESP32-S3
+  pinMode(RS485_DE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_PIN, RS485_RECEIVE); 
   RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   Serial.println("\n=== PARKING MASTER SYSTEM STARTED ===");
-  Serial.println("Master polling list:");
-  for(int i=0; i<spotCount; i++) {
-    Serial.println(" - " + spotIDs[i]);
-  }
-  Serial.println("=====================================\n");
-  delay(1000);
 }
 
 void loop() {
-  // Loop through all defined spots
-  for (int i = 0; i < spotCount; i++) {
-    // Remove extra spaces for the console print, but keep them if your protocol needs them
-    String currentSpot = spotIDs[i];
-    currentSpot.trim(); 
-    
-    pollSensor(currentSpot);
-    
-    delay(200); // Short delay between polling different sensors
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Lost... Reconnecting");
+    WiFi.reconnect();
   }
 
-  // Wait before starting the list over
+  for (int i = 0; i < spotCount; i++) {
+    String currentSpot = spotIDs[i];
+    currentSpot.trim(); 
+    pollSensor(currentSpot);
+    delay(200); 
+  }
   delay(POLL_INTERVAL);
 }
 
 void pollSensor(String id) {
-  Serial.print("Polling Spot [");
-  Serial.print(id);
-  Serial.print("]... ");
+  Serial.print("Polling Spot [" + id + "]... ");
 
-  // --- 1. SEND REQUEST ---
-  // Switch to Transmit Mode
   digitalWrite(RS485_DE_PIN, RS485_TRANSMIT);
-  delayMicroseconds(50); // Hardware switching delay
-  
-  // Send ID + Newline (Crucial: Slave waits for newline)
+  delayMicroseconds(50); 
   RS485Serial.println(id);
-  RS485Serial.flush();   // Wait for data to completely leave the buffer
-  
-  // Switch back to Receive Mode immediately
+  RS485Serial.flush();   
   digitalWrite(RS485_DE_PIN, RS485_RECEIVE);
   
-  // --- 2. WAIT FOR REPLY ---
   unsigned long startTime = millis();
   bool responseReceived = false;
   String response = "";
@@ -87,43 +78,62 @@ void pollSensor(String id) {
   while (millis() - startTime < POLL_TIMEOUT) {
     if (RS485Serial.available()) {
       char c = RS485Serial.read();
-      
-      // Stop reading at newline
       if (c == '\n') {
         responseReceived = true;
         break;
       }
-      
-      // Accumulate characters (ignore carriage return)
-      if (c != '\r') { 
-        response += c;
-      }
+      if (c != '\r') response += c;
     }
   }
 
-  // --- 3. PROCESS RESPONSE ---
   if (responseReceived) {
     response.trim();
-    
-    // Parse the response (Expected format: "A10:OCCUPIED" or "A10:VACANT")
     if (response.startsWith(id)) {
-      if (response.indexOf("OCCUPIED") != -1) {
+      String status = "";
+      if (response.indexOf("Taken") != -1) {
         Serial.println("Response: 🔴 OCCUPIED");
+        status = "Taken";
       } 
-      else if (response.indexOf("VACANT") != -1) {
+      else if (response.indexOf("Available") != -1) {
         Serial.println("Response: 🟢 VACANT");
+        status = "Available";
       }
-      else {
-        Serial.print("Response: "); // Unknown status
-        Serial.println(response);
+
+      if (status != "") {
+        sendToAWS(id, status);
       }
+
     } else {
-      Serial.print("Error: ID Mismatch (Received: ");
-      Serial.print(response);
-      Serial.println(")");
+      Serial.println("Error: ID Mismatch");
     }
-    
   } else {
     Serial.println("NO REPLY (Timeout)");
+  }
+}
+
+void sendToAWS(String spotId, String status) {
+  HTTPClient http;
+  
+  bool connected = http.begin(serverName); 
+  http.addHeader("Content-Type", "application/json");
+  if (!connected) {
+    Serial.println("Connection failed!");
+    return; 
+  }
+  StaticJsonDocument<5000> doc;
+  doc["spotId"] = spotId;
+  doc["status"] = status;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpResponseCode = http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+    Serial.print("AWS Response: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("AWS Error: ");
+    Serial.println(httpResponseCode);
   }
 }
